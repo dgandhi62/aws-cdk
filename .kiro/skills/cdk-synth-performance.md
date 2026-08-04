@@ -6,21 +6,47 @@ Domain knowledge for investigating CDK synthesis performance. Use this when a us
 
 ## CDK Synthesis Phases
 
-A CDK synth executes in distinct phases:
+A CDK synth executes in distinct phases. The code path is in `packages/aws-cdk-lib/core/lib/private/synthesis.ts`:
 
-| Phase | What happens |
-|-------|-------------|
-| **Load** | Node requires modules, compiles TypeScript |
-| **Construction** | User code runs — constructors, loops, file reads, all code before `app.synth()` |
-| **Synthesis** | Framework resolves tokens, reifies dependencies, renders CloudFormation templates |
-| **Bundling** | Docker builds, zip packaging for Lambda/assets |
+```
+App constructor            → marks start time (performance.now())
+  ... user code ...        → "Construction" phase (everything until app.synth())
+App.synth()                → measures "phase:Construction", then calls synthesize()
+  synthesize():
+    injectTreeMetadata()
+    synthNestedAssemblies()
+    invokeAspects() or invokeAspectsV2()
+    injectMetadataResources()
+    prepareApp()           → resolves cross-stack refs, reifies deps
+    validateTree()
+    synthesizeTree()       → renders each stack to CloudFormation JSON
+    generateFeatureFlagReport()
+    builder.buildAssembly()
+    validateTemplates()
+                           → measures "phase:Synthesis"
+```
+
+Bundling happens during construction when assets are staged (`AssetStaging` constructor calls Docker/zip operations).
 
 ## How to Capture Data
 
-### Perf Counters (all languages)
+### Perf Counters
 
 ```bash
 CDK_PERF_COUNTERS_FILE=./perf-counters.json npx cdk synth
+```
+
+**Important limitation:** The counters file is only written if the per-stack synth time exceeds a threshold (default: 10,000ms per stack). This is controlled by:
+- `performanceReporting` App prop (default: `true`)  
+- Context key `@aws-cdk/core.slowSynthThreshold` (default: `10000`)
+
+To force counters emission for fast apps, set the threshold to 0 in `cdk.json`:
+```json
+{
+  "context": {
+    "@aws-cdk/core.slowSynthThreshold": 0
+  }
+}
 ```
 
 Output format:
@@ -39,25 +65,42 @@ Output format:
     "fs.readFileSync(cnt)": 847,
     "child_process.execSync": 4200,
     "child_process.execSync(cnt)": 3,
-    "bundle:<source>": 8200,
-    "bundle:<source>(cnt)": 1,
+    "bundle:lambda/handler": 8200,
+    "bundle:lambda/handler(cnt)": 1,
     "validateTemplates": 1100,
     "validateTemplates(cnt)": 1
   }
 }
 ```
 
-Values without `(cnt)` suffix are milliseconds. Values with `(cnt)` are call counts.
+Values without `(cnt)` suffix are milliseconds. Values with `(cnt)` are invocation counts.
 
-Currently instrumented operations:
-- `phase:Load`, `phase:Construction`, `phase:Synthesis` — coarse phases
-- `Stack.resolve` — token resolution
-- `fs.*` — file I/O (readFileSync, writeFileSync, statSync, etc.)
-- `child_process.*` — subprocess calls
-- `bundle:<source>` — per-asset bundling
-- `validateTemplates` — template validation
-- `BundlingDockerImage.run`, `DockerImage.fromBuild` — Docker operations
-- `AssetBundlingBindMount.run`, `AssetBundlingVolumeCopy.run` — asset bundling methods
+**What is currently instrumented** (verified in codebase):
+
+| Counter key | Source | Mechanism |
+|-------------|--------|-----------|
+| `phase:Load` | `app.ts` | `performance.measure()` from process start to App constructor |
+| `phase:Construction` | `app.ts` | `performance.measure()` from App constructor to `app.synth()` call |
+| `phase:Synthesis` | `app.ts` | `performance.measure()` from `app.synth()` start to end |
+| `Stack.resolve` | `stack.ts` | `@profileFn` decorator on `Stack.resolve()` |
+| `fs.*` | `perf.ts` | `profileObj('fs')` wraps all `fs` module functions |
+| `child_process.*` | `perf.ts` | `profileObj('child_process')` wraps all `child_process` functions |
+| `bundle:<source>` | `asset-staging.ts` | `profileSpan` around asset bundling |
+| `validateTemplates` | `synthesis-validation.ts` | `profileSpan` around template validation |
+| `BundlingDockerImage.run` | `bundling.ts` | `@profileFn` decorator |
+| `DockerImage.fromBuild` | `bundling.ts` | `@profileFn` decorator |
+| `AssetBundlingBindMount.run` | `private/asset-staging.ts` | `@profileFn` decorator |
+| `AssetBundlingVolumeCopy.run` | `private/asset-staging.ts` | `@profileFn` decorator |
+
+**What is NOT instrumented** (no counters exist for these):
+- Individual synthesis sub-phases (aspects, prepareApp, resolveReferences, synthesizeTree) — all lumped into `phase:Synthesis`
+- `findTokens` call count
+- `_addAssemblyDependency` call count
+- `_toCloudFormation` call count per stack
+- Per-stack timing
+- Cross-stack export count
+
+**Nesting behavior:** `profileFn` tracks nesting depth. Only the outermost call emits a measurement. Nested `Stack.resolve` calls (resolve calling resolve) are NOT double-counted. Similarly, `fs.readFileSync` called from within another profiled `fs` operation won't be counted separately.
 
 ### CPU Profile (TypeScript apps only)
 
@@ -65,7 +108,7 @@ Currently instrumented operations:
 NODE_OPTIONS="--cpu-prof --cpu-prof-dir=./cdk-perf --max-old-space-size=8192" npx cdk synth
 ```
 
-Parse top functions:
+Parse top functions by self-time (where the CPU is actually spending time):
 
 ```bash
 node -e "
@@ -82,9 +125,11 @@ console.log('Total: '+(ms/1000).toFixed(1)+'s');
 " ./cdk-perf/*.cpuprofile
 ```
 
-**Limitation:** CPU profiles are sampled (~1ms intervals). They estimate proportional time but do not provide exact call counts.
-
-**Limitation:** `--cpu-prof` only flushes on graceful exit. If synth OOMs or is killed, the profile is empty.
+**Limitations:**
+- CPU profiles are sampled (~1ms intervals). They give proportional time estimates, not exact call counts.
+- `--cpu-prof` only flushes on graceful exit. If synth OOMs or is killed, the profile is empty. Always use `--max-old-space-size=8192`.
+- `--cpu-prof` breaks non-TypeScript CDK apps (Python/Java/Go/.NET) — it corrupts the jsii kernel stdout handshake.
+- I/O-blocked time (waiting for Docker, file system) shows as idle — the CPU profile underreports wall-clock cost of subprocess and I/O operations.
 
 ### Stack Metrics (from cdk.out)
 
@@ -110,95 +155,104 @@ done | sort | uniq -c -w8 | sort -rn
 
 ## Function Name → Phase Mapping
 
-When reading a CPU profile, these CDK internal functions correspond to synthesis sub-phases:
+When reading a CPU profile, these CDK internal functions correspond to synthesis sub-phases. Verified against the codebase:
 
-| Function | Phase |
-|----------|-------|
-| `synthesize` | Synthesis entry point |
-| `synthNestedAssemblies` | Recursive synth of nested stages |
-| `invokeAspects` / `invokeAspectsV2` | Aspect invocation |
-| `prepareApp` | Prepare (resolves refs + reifies deps) |
-| `resolveReferences` / `findTokens` | Cross-stack reference resolution |
-| `reifyConstructDependencies` | Expanding construct deps to resource-level deps |
-| `_addAssemblyDependency` / `operateOnDependency` | Individual dependency edge creation |
-| `validateTree` | Running construct validators |
-| `synthesizeTree` / `_toCloudFormation` | Rendering stacks to CloudFormation JSON |
-| `buildAssembly` | Writing cloud assembly manifest |
-| `Stack.resolve` / `resolve` | Token resolution |
-| `BundlingDockerImage.run` / `DockerImage.fromBuild` | Docker asset bundling |
+| Function | File | What it does |
+|----------|------|-------------|
+| `synthesize` | `core/lib/private/synthesis.ts` | Top-level synthesis orchestrator |
+| `synthNestedAssemblies` | `core/lib/private/synthesis.ts` | Calls `synth()` on nested Stage constructs |
+| `invokeAspects` | `core/lib/private/synthesis.ts` | Runs registered aspects on all constructs |
+| `invokeAspectsV2` | `core/lib/private/synthesis.ts` | Aspects with stabilization loop (if feature flag enabled) |
+| `prepareApp` | `core/lib/private/prepare-app.ts` | Reifies construct deps to resource deps + resolves cross-stack refs |
+| `findTransitiveDeps` | `core/lib/private/prepare-app.ts` | Collects all `.node.dependencies` across the tree |
+| `resolveReferences` | `core/lib/private/refs.ts` | Finds and resolves cross-stack token references |
+| `findAllReferences` | `core/lib/private/refs.ts` | Iterates all CfnElements, calls `findTokens` on each |
+| `findTokens` | `core/lib/private/resolve.ts` | Renders a CfnElement via `_toCloudFormation()` to discover tokens |
+| `operateOnDependency` | `core/lib/deps.ts` | Adds/removes a dependency edge between two elements |
+| `_addAssemblyDependency` | `core/lib/stack.ts` | Records a stack-to-stack dependency (when no common ancestor stack) |
+| `addResourceDependency` | called in `prepare-app.ts` loop | Adds CloudFormation `DependsOn` between resources |
+| `validateTree` | `core/lib/private/synthesis.ts` | Calls `.node.validate()` on every construct |
+| `synthesizeTree` | `core/lib/private/synthesis.ts` | Visits all constructs, calls `stack.synthesizer.synthesize()` per stack |
+| `_toCloudFormation` | `core/lib/stack.ts` | Renders all CfnElements in a stack to CloudFormation template JSON |
+| `buildAssembly` | `cloud-assembly-api` package | Writes the cloud assembly manifest to disk |
+| `validateTemplates` | `core/lib/private/synthesis-validation.ts` | Runs policy validation plugins against rendered templates |
+| `BundlingDockerImage.run` | `core/lib/bundling.ts` | Executes Docker container for asset bundling |
+| `DockerImage.fromBuild` | `core/lib/bundling.ts` | Builds a Docker image from Dockerfile |
 
 ## Known Patterns
 
-These are patterns observed in real CDK apps. When you see the signal, investigate the cause. The appropriate action depends on the user's architecture and constraints.
+These are patterns observed in real CDK apps. When you see the signal, investigate the mechanism.
 
-### Dependency Explosion
+### Dependency Expansion in prepareApp
 
-**Signal:** `_addAssemblyDependency` or `operateOnDependency` dominates the profile.
+**Signal:** In CPU profile, `prepareApp` or `addResourceDependency` shows high time. The loop in `prepareApp` iterates all construct-level dependencies and expands them to resource-level DependsOn edges.
 
-**Mechanism:** `.node.addDependency(otherConstruct)` expands to N×M resource-level dependency edges. The framework calls `_addAssemblyDependency` once per edge. 50 resources depending on 50 resources = 2,500 calls.
+**Mechanism (from prepare-app.ts):**
+```
+for each (source, target) in findTransitiveDeps(root):
+  for each CfnResource in target:
+    for each CfnResource in source:
+      source.addResourceDependency(target)
+```
 
-**What to look for:** Search the user's code for `.node.addDependency()` calls, particularly inside loops or applied broadly across constructs. Compare with `stack.addDependency()` which creates a single stack-level edge.
+If a construct with 50 resources depends on another construct with 50 resources, this creates 2,500 `DependsOn` entries. The user called `.node.addDependency()` once, but the framework expands it to N×M.
 
-### Cross-Stack Reference Scan
+**What to look for:** Search user code for `.node.addDependency()`. Check if the source/target constructs contain many CfnResources. `stack.addDependency()` creates a single assembly-level edge without resource expansion.
 
-**Signal:** `resolveReferences` / `findTokens` takes significant time. High `Stack.resolve` count.
+### Cross-Stack Assembly Dependencies
 
-**Mechanism:** Each cross-stack reference (using a value from one stack in another) forces CDK to render the producing stack's template to locate the token, then render the consuming stack to inject the import. More exports = more full-template renders.
+**Signal:** `_addAssemblyDependency` or `operateOnDependency` visible in profile. This is the path taken when source and target don't share a common ancestor stack.
 
-**What to look for:** Count cross-stack exports in `cdk.out` templates. Examine how stacks reference each other's resources.
+**Mechanism (from deps.ts):** `operateOnDependency` finds the deepest common stack. If none exists (different top-level stacks), it calls `_addAssemblyDependency` on the top-level source stack, recording a stack-to-stack dependency with a reason object.
 
-### Construction-Dominant
+**What to look for:** Cross-stack `.node.addDependency()` calls between constructs in separate top-level stacks.
 
-**Signal:** `phase:Construction` is the majority of total time. CPU profile shows time in user code files, not CDK framework files.
+### Reference Resolution Renders
 
-**Mechanism:** All code between `new App()` and `app.synth()` runs during construction. This includes any I/O, API calls, or computation the user performs.
+**Signal:** `findAllReferences` or `findTokens` or `_toCloudFormation` shows high time during the `prepareApp` portion of synthesis.
 
-**What to look for:** Examine user construct code for synchronous operations — file reads, HTTP calls, expensive computations, large iteration counts.
+**Mechanism (from refs.ts):** `resolveReferences` calls `findAllReferences` which iterates every `CfnElement` and calls `findTokens(consumer, () => consumer._toCloudFormation())`. This renders each element to CloudFormation JSON to discover cross-stack token references.
 
-### Bundling-Dominant
+Then during `synthesizeTree`, each stack calls `_toCloudFormation()` again to produce the final template. So each CfnElement is rendered at minimum twice. If nested stacks exist, `resolveReferences` is called a second time (after `defineNestedStackAsset`), adding a third render.
 
-**Signal:** `child_process.*` high in counters. `bundle:*` spans account for significant time.
+**What to look for:** Total CfnElement count across all stacks. Number of cross-stack references. Nested stack depth. The cost scales with (number of CfnElements) × (number of resolveReferences passes).
 
-**Mechanism:** Each bundled asset (Lambda, Docker image) spawns a subprocess. Docker builds without cache hit rebuild from scratch.
+### Construction Phase Cost
 
-**What to look for:** Number of bundled assets. Docker build contexts (presence/absence of `.dockerignore`). Whether `bundling.local` is configured.
+**Signal:** `phase:Construction` in perf counters is the majority of total time. CPU profile shows time in user files (user's `lib/`, `bin/` directories), not in `node_modules/aws-cdk-lib/`.
 
-### File System Load
+**Mechanism:** Everything between `new App()` and `app.synth()` is construction time. The framework measures this with a single `performance.measure('phase:Construction', ...)` in `app.ts`.
 
-**Signal:** High `fs.readFileSync` count and time in counters.
+**What to look for:** User construct code for synchronous operations — `fs.readFileSync`, HTTP calls, `child_process.execSync`, expensive loops, large iteration counts. Third-party construct libraries that do work in constructors.
 
-**Mechanism:** `CfnInclude` reads and parses a CloudFormation template per instantiation. Asset fingerprinting reads files to compute hashes. Module resolution reads `package.json` files.
+### Bundling Cost
 
-**What to look for:** `CfnInclude` usage count. Size of asset directories being fingerprinted. Number of packages in `node_modules`.
+**Signal:** `child_process.execSync` or `child_process.spawnSync` high in counters. `bundle:<source>` spans visible. `BundlingDockerImage.run` in profile.
 
-### Template Rendering Cost
+**Mechanism:** `AssetStaging` (in `asset-staging.ts`) wraps bundling in a `profileSpan('bundle:<source>')`. Each bundled asset spawns a Docker container or runs a local command.
 
-**Signal:** `_toCloudFormation` / `synthesizeTree` takes significant time relative to resource count.
+**What to look for:** Number of bundled assets. Docker build context sizes. Presence of `.dockerignore`. Whether `bundling.local` is configured. Docker layer cache behavior.
 
-**Mechanism:** CDK renders templates during reference resolution (to find tokens) AND during final synthesis. Cross-stack references and nested stacks can multiply renders.
+### File System Cost
 
-**What to look for:** Number of resources per stack. Template sizes. Whether `_toCloudFormation` call count exceeds stack count (indicates multiple renders).
+**Signal:** `fs.readFileSync` count high in counters (check `fs.readFileSync(cnt)` value).
 
-### Token Resolution Volume
+**Mechanism:** `profileObj('fs')` in `perf.ts` wraps the entire `fs` module. Only top-level calls are counted (nesting-aware). Common sources: `CfnInclude` parsing templates, asset fingerprinting reading directories, `require()` loading modules.
 
-**Signal:** `Stack.resolve` has very high call count (visible in perf counters).
-
-**Mechanism:** Every token in every resource property must be resolved during synthesis. More resources × more properties × more tokens = more resolve calls.
-
-**What to look for:** Total resource count.
+**What to look for:** `CfnInclude` usage (each instantiation reads + JSON.parses a CloudFormation template). Large asset source directories being fingerprinted. Deep `node_modules` trees.
 
 ## Structural Observations
 
 These can be collected from `cdk.out` without profiling:
 
-| Observation | What it tells you |
-|-------------|-------------------|
-| Resource count per stack | Rendering cost scales with resource count |
-| Template file size | Large templates take longer to render and serialize |
-| Cross-stack export count | Each export increases reference resolution work |
-| Number of structurally identical stacks (same resource types) | Repeated work pattern — same template rendered N times |
-| Number of `CfnInclude` resources | Each one parses a full CloudFormation template at construction time |
-| Number of bundled assets | Each spawns a subprocess (usually Docker) |
+| Observation | Relevance |
+|-------------|-----------|
+| Resource count per stack | Rendering cost in `_toCloudFormation` scales linearly with element count |
+| Template file size | Serialization + disk write cost |
+| Cross-stack exports (Outputs with Export) | Each triggers token scan in consuming stacks during `resolveReferences` |
+| Structurally identical stacks (same resource types) | Same rendering work repeated N times |
+| `CfnInclude` resources in templates | Each one parsed a full CloudFormation template at construction time |
+| Number of bundled assets | Each spawned a subprocess |
 
 ## Investigation Process
 
@@ -206,59 +260,61 @@ After capturing data, investigate the app itself to connect signals to causes.
 
 ### From Data to Code
 
-1. **Identify the dominant phase** from perf counters (`phase:Load`, `phase:Construction`, `phase:Synthesis`). This tells you where to look.
+1. **Identify the dominant phase** from perf counters. Look at `phase:Load`, `phase:Construction`, `phase:Synthesis` values. This tells you where to focus.
 
-2. **If Construction dominates:** Read the user's app entry point (usually `bin/*.ts` or `lib/*.ts`). Trace what runs between `new App()` and `app.synth()`. Look for:
-   - Loops that instantiate constructs
-   - File reads (`fs.readFileSync` calls in user code)
-   - Any synchronous I/O or computation
-   - Third-party construct libraries that do work in their constructors
+2. **If Construction dominates:** Read the user's app entry point. Find it from `cdk.json` → `"app"` field. Trace what runs between `new App()` and `app.synth()`. Look for:
+   - Loops that instantiate constructs (check iteration count)
+   - `fs.readFileSync` calls in user code (not framework)
+   - `child_process` calls in user code (bundling happens during construction)
+   - Third-party construct libraries that do initialization work
+   - Context lookups that might be slow
 
-3. **If Synthesis dominates:** Look at the profile for which sub-function is expensive, then trace into the app's architecture:
-   - High `_addAssemblyDependency` → search user code for `.node.addDependency(` calls. Count them. Check if they're in loops.
-   - High `resolveReferences` / `findTokens` → count cross-stack references. Look at how stacks pass values to each other (`stack.exportValue`, referencing `otherStack.resource.attr`).
-   - High `_toCloudFormation` → check if call count exceeds stack count (indicates re-rendering). Look at nested stacks and cross-stack ref patterns.
-   - High `Stack.resolve` count → look at total resource count and CDK version.
+3. **If Synthesis dominates:** The perf counters don't break down synthesis sub-phases. Use the CPU profile to identify which sub-function is expensive:
+   - Time in `prepareApp` / `findTransitiveDeps` / `addResourceDependency` → search user code for `.node.addDependency()` calls. Count them. Check if inside loops. Check resource counts of source/target constructs.
+   - Time in `resolveReferences` / `findAllReferences` / `findTokens` → count cross-stack exports in `cdk.out` templates. Look at how stacks reference each other's attributes.
+   - Time in `synthesizeTree` / `_toCloudFormation` → check total resource count per stack. Large stacks render slowly.
+   - Time in `Stack.resolve` → the `Stack.resolve(cnt)` counter gives exact outermost call count. High count = many tokens being resolved.
 
-4. **If Bundling dominates:** Find which assets are bundled. Check:
-   - `cdk.out/asset.*` directories — what's in them, how large
-   - Presence of `.dockerignore` in bundled source directories
-   - Whether `bundling.local` is configured in the construct props
-   - Docker build output for cache hit/miss patterns
+4. **If Bundling dominates:** Check `child_process.*` and `bundle:*` counters. Find which assets:
+   - Look at `cdk.out/asset.*` directories
+   - Check for `.dockerignore` in bundled source directories
+   - Check if `bundling.local` is configured in construct props
+   - Check Docker layer cache behavior (run Docker build manually to see)
 
 5. **If Load dominates:** Check:
-   - `node_modules` size and depth
-   - Whether the app uses `ts-node` (compiles on the fly) vs pre-compiled
-   - Number of `require`/`import` statements in the entry point chain
+   - Whether app uses `ts-node` (runtime compilation) vs pre-compiled JavaScript
+   - Size and depth of `node_modules`
+   - Number of top-level imports/requires in the entry chain
 
 ### Correlating Signals
 
-Cross-reference multiple data points to confirm a hypothesis:
+Cross-reference data points to confirm a hypothesis:
 
-- High `_addAssemblyDependency` in profile + user code has `.node.addDependency()` in a loop → confirmed dependency explosion
-- High `fs.readFileSync` count + user code has multiple `CfnInclude` instantiations → confirmed template parsing overhead
-- High `child_process.execSync` time + large asset directories without `.dockerignore` → confirmed unbounded Docker context
-- High `Stack.resolve` count + many cross-stack exports in templates + high `resolveReferences` time → confirmed reference resolution overhead
-- `phase:Construction` dominant + profile shows time in user's `lib/` files, not `node_modules/aws-cdk-lib/` → confirmed user-code bottleneck
+- High time in `prepareApp` in profile + user code has `.node.addDependency()` in a loop + source/target constructs have many CfnResources → dependency expansion is the cost
+- High `fs.readFileSync(cnt)` in counters + user code has multiple `CfnInclude` instantiations → template parsing overhead
+- High `child_process.execSync` time in counters + large asset source directories without `.dockerignore` → unbounded Docker build context
+- High `Stack.resolve(cnt)` + many cross-stack Outputs with Export in templates + high time in `resolveReferences` in profile → reference resolution cost
+- `phase:Construction` dominant + profile shows time in user's `lib/` files, not in `aws-cdk-lib/` paths → user-code bottleneck
 
 ### Reading the User's Code
 
 When examining the app:
 
-- Start with `cdk.json` → find the `"app"` command → find the entry point
+- Start with `cdk.json` → find the `"app"` command → find the entry point file
 - Trace the construct tree: App → Stage(s) → Stack(s) → Constructs
-- Look for patterns that scale poorly: loops creating constructs, constructs that reference other stacks, deep nesting
-- Check if custom constructs or third-party libraries do expensive initialization
-- Look at how many stacks exist and how they reference each other (the dependency graph)
+- Look for patterns that scale: loops creating constructs, constructs that reference other stacks, deep nesting
+- Check custom constructs or third-party libraries for expensive initialization
+- Count stacks and map how they reference each other (the dependency/reference graph)
+- Look for `.node.addDependency()` usage vs `stack.addDependency()`
 
 ### What to Report
 
 Present:
 
-1. **Raw data** — the actual counters and/or profile top functions
-2. **Phase breakdown** — time attributed to each phase
+1. **Raw data** — the actual perf counter values and/or CPU profile top functions
+2. **Phase breakdown** — time attributed to each phase, with percentages
 3. **Observations** — what the data shows, correlated with what you found in the code
-4. **Root causes** — the specific code patterns or architectural decisions connected to the observed cost
-5. **Context** — relevant structural metrics from `cdk.out`
+4. **Root causes** — the specific code patterns or architectural decisions connected to the observed cost, with file paths and line numbers where possible
+5. **Structural context** — relevant metrics from `cdk.out` (resource counts, template sizes, export counts)
 
 Connect the numbers to the code. "X ms is spent in Y because your code does Z here [file:line]."
