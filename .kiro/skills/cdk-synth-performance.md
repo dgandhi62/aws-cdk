@@ -44,13 +44,6 @@ The profile is JSON. Read it and look at the `nodes` array — each node has a `
 
 To determine where time is spent, look at which functions appear in the call stack for each sample. A sample "belongs" to a phase based on which CDK framework function is an ancestor in the call tree.
 
-### Limitations
-
-- CPU profiles are sampled (~1ms intervals). They give proportional time estimates, not exact call counts.
-- `--cpu-prof` only flushes on graceful exit. If synth OOMs or is killed, the profile is empty. Always use `--max-old-space-size=8192`.
-- `--cpu-prof` breaks non-TypeScript CDK apps (Python/Java/Go/.NET) — it corrupts the jsii kernel stdout handshake.
-- I/O-blocked time (waiting for Docker, file system) shows as idle in the CPU profile. Wall-clock cost of subprocess and I/O operations is underreported.
-
 ## Function Name → Phase Mapping
 
 When reading a CPU profile, these CDK internal functions correspond to synthesis sub-phases:
@@ -98,42 +91,42 @@ These can be collected from `cdk.out` without profiling:
 | `CfnInclude` resources in templates | Each one parsed a full CloudFormation template at construction time |
 | Number of bundled assets | Each spawned a subprocess |
 
-## Investigation Process
+## Investigation Guidance
 
-After capturing data, investigate the app itself to connect signals to causes.
+These are things to keep in mind when investigating, not a rigid procedure. Use your judgment based on what the data shows.
 
-### From Data to Code
+### Identifying the Dominant Phase
 
-1. **Identify the dominant phase** from the CPU profile phase breakdown. This tells you where to focus.
+Use the CPU profile phase breakdown to understand where time goes. Once you know the dominant phase, look at the app code for what's driving the cost.
 
-2. **If Construction dominates:** Read the user's app entry point. Find it from `cdk.json` → `"app"` field. Trace what runs between `new App()` and `app.synth()`. Look for:
+**Construction-dominant:** Look at the user's app entry point (find via `cdk.json` → `"app"` field). Everything between `new App()` and `app.synth()` is construction. Common things to look for:
    - Loops that instantiate constructs (check iteration count)
    - `fs.readFileSync` calls in user code
    - `child_process` calls in user code (bundling happens during construction)
    - Third-party construct libraries that do initialization work
    - Context lookups that might be slow
 
-3. **If Synthesis dominates:** Look at which sub-phase is expensive:
+**Synthesis-dominant:** Look at which sub-phase is expensive in the profile:
    - **prepareApp dominant:**
      - Time in `findTransitiveDeps` / `addResourceDependency` → search user code for `.node.addDependency()` calls. Count them. Check if inside loops. Check resource counts of source/target constructs. `.node.addDependency()` expands to N×M resource-level edges.
      - Time in `resolveReferences` / `findAllReferences` / `findTokens` → count cross-stack exports in `cdk.out` templates. Each export causes CDK to render every CfnElement in the consuming stack to find tokens.
    - **synthesizeTree dominant:** Check total resource count per stack. `_toCloudFormation` renders every CfnElement. Each element is rendered at minimum twice (once in `findAllReferences`, once in `synthesizeTree`).
    - **invokeAspects dominant:** Check how many aspects are registered and how many constructs they visit.
 
-4. **If Bundling dominates:** Find which assets are bundled. Check:
+**Bundling-dominant:** Find which assets are bundled. Things to check:
    - `cdk.out/asset.*` directories — what's in them, how large
    - Presence of `.dockerignore` in bundled source directories
    - Whether `bundling.local` is configured in the construct props
    - Docker build output for cache hit/miss patterns
 
-5. **If Load dominates:** Check:
+**Load-dominant:** Things to check:
    - Whether app uses `ts-node` (runtime compilation) vs pre-compiled JavaScript
    - Size and depth of `node_modules`
    - Number of top-level imports/requires in the entry chain
 
 ### Correlating Signals
 
-Cross-reference multiple data points to confirm a hypothesis:
+Some combinations of signals that tend to confirm a hypothesis:
 
 - High time in `prepareApp` in profile + user code has `.node.addDependency()` in a loop + source/target constructs have many CfnResources → dependency expansion is the cost
 - High time in `resolveReferences` + many cross-stack Outputs with Export in templates → reference resolution cost
@@ -143,7 +136,7 @@ Cross-reference multiple data points to confirm a hypothesis:
 
 ### Reading the User's Code
 
-When examining the app:
+Some things to keep in mind when examining the app:
 
 - Start with `cdk.json` → find the `"app"` command → find the entry point file
 - Trace the construct tree: App → Stage(s) → Stack(s) → Constructs
