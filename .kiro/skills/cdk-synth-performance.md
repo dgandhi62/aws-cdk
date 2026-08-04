@@ -75,32 +75,7 @@ Output format:
 
 Values without `(cnt)` suffix are milliseconds. Values with `(cnt)` are invocation counts.
 
-**What is currently instrumented** (verified in codebase):
-
-| Counter key | Source | Mechanism |
-|-------------|--------|-----------|
-| `phase:Load` | `app.ts` | `performance.measure()` from process start to App constructor |
-| `phase:Construction` | `app.ts` | `performance.measure()` from App constructor to `app.synth()` call |
-| `phase:Synthesis` | `app.ts` | `performance.measure()` from `app.synth()` start to end |
-| `Stack.resolve` | `stack.ts` | `@profileFn` decorator on `Stack.resolve()` |
-| `fs.*` | `perf.ts` | `profileObj('fs')` wraps all `fs` module functions |
-| `child_process.*` | `perf.ts` | `profileObj('child_process')` wraps all `child_process` functions |
-| `bundle:<source>` | `asset-staging.ts` | `profileSpan` around asset bundling |
-| `validateTemplates` | `synthesis-validation.ts` | `profileSpan` around template validation |
-| `BundlingDockerImage.run` | `bundling.ts` | `@profileFn` decorator |
-| `DockerImage.fromBuild` | `bundling.ts` | `@profileFn` decorator |
-| `AssetBundlingBindMount.run` | `private/asset-staging.ts` | `@profileFn` decorator |
-| `AssetBundlingVolumeCopy.run` | `private/asset-staging.ts` | `@profileFn` decorator |
-
-**What is NOT instrumented** (no counters exist for these):
-- Individual synthesis sub-phases (aspects, prepareApp, resolveReferences, synthesizeTree) — all lumped into `phase:Synthesis`
-- `findTokens` call count
-- `_addAssemblyDependency` call count
-- `_toCloudFormation` call count per stack
-- Per-stack timing
-- Cross-stack export count
-
-**Nesting behavior:** `profileFn` tracks nesting depth. Only the outermost call emits a measurement. Nested `Stack.resolve` calls (resolve calling resolve) are NOT double-counted. Similarly, `fs.readFileSync` called from within another profiled `fs` operation won't be counted separately.
+Currently instrumented: `phase:Load`, `phase:Construction`, `phase:Synthesis`, `Stack.resolve`, `fs.*`, `child_process.*`, `bundle:<source>`, `validateTemplates`, `BundlingDockerImage.run`, `DockerImage.fromBuild`, `AssetBundlingBindMount.run`, `AssetBundlingVolumeCopy.run`.
 
 ### CPU Profile (TypeScript apps only)
 
@@ -178,68 +153,6 @@ When reading a CPU profile, these CDK internal functions correspond to synthesis
 | `validateTemplates` | `core/lib/private/synthesis-validation.ts` | Runs policy validation plugins against rendered templates |
 | `BundlingDockerImage.run` | `core/lib/bundling.ts` | Executes Docker container for asset bundling |
 | `DockerImage.fromBuild` | `core/lib/bundling.ts` | Builds a Docker image from Dockerfile |
-
-## Known Patterns
-
-These are patterns observed in real CDK apps. When you see the signal, investigate the mechanism.
-
-### Dependency Expansion in prepareApp
-
-**Signal:** In CPU profile, `prepareApp` or `addResourceDependency` shows high time. The loop in `prepareApp` iterates all construct-level dependencies and expands them to resource-level DependsOn edges.
-
-**Mechanism (from prepare-app.ts):**
-```
-for each (source, target) in findTransitiveDeps(root):
-  for each CfnResource in target:
-    for each CfnResource in source:
-      source.addResourceDependency(target)
-```
-
-If a construct with 50 resources depends on another construct with 50 resources, this creates 2,500 `DependsOn` entries. The user called `.node.addDependency()` once, but the framework expands it to N×M.
-
-**What to look for:** Search user code for `.node.addDependency()`. Check if the source/target constructs contain many CfnResources. `stack.addDependency()` creates a single assembly-level edge without resource expansion.
-
-### Cross-Stack Assembly Dependencies
-
-**Signal:** `_addAssemblyDependency` or `operateOnDependency` visible in profile. This is the path taken when source and target don't share a common ancestor stack.
-
-**Mechanism (from deps.ts):** `operateOnDependency` finds the deepest common stack. If none exists (different top-level stacks), it calls `_addAssemblyDependency` on the top-level source stack, recording a stack-to-stack dependency with a reason object.
-
-**What to look for:** Cross-stack `.node.addDependency()` calls between constructs in separate top-level stacks.
-
-### Reference Resolution Renders
-
-**Signal:** `findAllReferences` or `findTokens` or `_toCloudFormation` shows high time during the `prepareApp` portion of synthesis.
-
-**Mechanism (from refs.ts):** `resolveReferences` calls `findAllReferences` which iterates every `CfnElement` and calls `findTokens(consumer, () => consumer._toCloudFormation())`. This renders each element to CloudFormation JSON to discover cross-stack token references.
-
-Then during `synthesizeTree`, each stack calls `_toCloudFormation()` again to produce the final template. So each CfnElement is rendered at minimum twice. If nested stacks exist, `resolveReferences` is called a second time (after `defineNestedStackAsset`), adding a third render.
-
-**What to look for:** Total CfnElement count across all stacks. Number of cross-stack references. Nested stack depth. The cost scales with (number of CfnElements) × (number of resolveReferences passes).
-
-### Construction Phase Cost
-
-**Signal:** `phase:Construction` in perf counters is the majority of total time. CPU profile shows time in user files (user's `lib/`, `bin/` directories), not in `node_modules/aws-cdk-lib/`.
-
-**Mechanism:** Everything between `new App()` and `app.synth()` is construction time. The framework measures this with a single `performance.measure('phase:Construction', ...)` in `app.ts`.
-
-**What to look for:** User construct code for synchronous operations — `fs.readFileSync`, HTTP calls, `child_process.execSync`, expensive loops, large iteration counts. Third-party construct libraries that do work in constructors.
-
-### Bundling Cost
-
-**Signal:** `child_process.execSync` or `child_process.spawnSync` high in counters. `bundle:<source>` spans visible. `BundlingDockerImage.run` in profile.
-
-**Mechanism:** `AssetStaging` (in `asset-staging.ts`) wraps bundling in a `profileSpan('bundle:<source>')`. Each bundled asset spawns a Docker container or runs a local command.
-
-**What to look for:** Number of bundled assets. Docker build context sizes. Presence of `.dockerignore`. Whether `bundling.local` is configured. Docker layer cache behavior.
-
-### File System Cost
-
-**Signal:** `fs.readFileSync` count high in counters (check `fs.readFileSync(cnt)` value).
-
-**Mechanism:** `profileObj('fs')` in `perf.ts` wraps the entire `fs` module. Only top-level calls are counted (nesting-aware). Common sources: `CfnInclude` parsing templates, asset fingerprinting reading directories, `require()` loading modules.
-
-**What to look for:** `CfnInclude` usage (each instantiation reads + JSON.parses a CloudFormation template). Large asset source directories being fingerprinted. Deep `node_modules` trees.
 
 ## Structural Observations
 
