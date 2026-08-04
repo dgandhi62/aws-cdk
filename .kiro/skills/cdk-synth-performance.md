@@ -29,11 +29,9 @@ Bundling happens during construction when assets are staged (`AssetStaging` cons
 
 ## How to Capture a CPU Profile
 
-```bash
-NODE_OPTIONS="--cpu-prof --cpu-prof-dir=./cdk-perf --max-old-space-size=8192" npx cdk synth
-```
+Run CDK synth with `NODE_OPTIONS` set to enable CPU profiling. Use `--cpu-prof` to produce a `.cpuprofile` file, `--cpu-prof-dir` to control where it lands, and `--max-old-space-size=8192` to prevent OOM before the profile flushes.
 
-The `.cpuprofile` file will be in `./cdk-perf/`. It's a JSON file with:
+The resulting `.cpuprofile` is JSON with:
 - `nodes`: call frame objects with `id`, `callFrame` (functionName, url, lineNumber), `hitCount`, `children`
 - `samples`: array of node IDs (one per sample interval, ~1ms)
 - `timeDeltas`: array of microsecond deltas between samples
