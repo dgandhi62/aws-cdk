@@ -13,13 +13,13 @@ Domain knowledge for investigating CDK synthesis performance. Use this when a us
 >   region lookup    transpile         child_process        synthesizeTree)
 > ```
 >
-> **In the field, the bottleneck is usually NOT framework synthesis.** Across real engagements the dominant cost has been: a dependency shelling out during construction (60%), CLI startup blocking on IMDS (~7s), and construction/module-load (~90%). The function-to-phase table further down covers framework synthesis in detail — but do **not** assume that's where the time is. Attribute to one of the four segments *first*, then zoom in.
+> The function-to-phase table further down covers framework synthesis in detail — but do **not** assume that's where the time is. Attribute to one of the four segments *first*, then zoom in.
 
 ## Measurement Discipline (do this before anything else)
 
 Bad measurement produces confident wrong answers. Before you report any number or recommend any change:
 
-- **Same workspace, same session, same commit.** Baseline and fixed-state must be measured in the same workspace and in the same session. Never compare a baseline on one commit against a fix on a different commit — you will attribute environmental or unrelated changes to your fix. (One real engagement reported a 52% gain that was actually 47% for exactly this reason.)
+- **Same workspace, same session, same commit.** Baseline and fixed-state must be measured in the same workspace and in the same session. Never compare a baseline on one commit against a fix on a different commit — you will attribute environmental or unrelated changes to your fix. 
 - **At least two runs each, report the spread.** Run-to-run variance under load has been measured at ~7.5s — easily enough to swamp a real 26s gain in a single package. Take ≥2 runs for baseline and ≥2 for fixed state; report min/median, not a single number.
 - **Watch what's inside the measured command.** A chained `&& npm run ...` (or `yarn build &&`) in `cdk.json`'s `"app"` field runs *inside* the measured wall time (~3–5s observed). A nested `yarn <script>` wrapper adds ~500–900ms per invocation. Decide explicitly whether you're measuring "synth" or "build + synth," and state it.
 - **Diminishing returns floor.** For small apps that load `aws-cdk-lib`, ~2s of Node startup + library load is currently unavoidable regardless of toolchain. **Below ~5s wall-clock, further investigation has sharply diminishing returns** — say so and stop rather than chasing noise.
@@ -36,17 +36,6 @@ The **first** branch in diagnosis is comparing total wall-clock against on-CPU t
 
 Establishing this ratio early prevents the most common dead end: profiling CPU for minutes when the time is actually spent waiting.
 
-## CDK CLI Startup (before user code runs)
-
-Some of the wall-clock happens in the `cdk` CLI itself, *before* your app's `new App()` executes — so it never appears attributed to a CDK framework function in the app profile.
-
-- **IMDS region lookup regression.** Known on `aws-cdk@2.1118.0`: when synth runs with no `AWS_REGION` set (laptop, CI, EC2 without the env var), the CLI blocks on two failed `169.254.169.254` region-lookup attempts, ~3.5s each (~7s total). Fixed in later `2.113x` releases.
-  - **Diagnose:** run `cdk synth --verbose --verbose` and look for `Looking up AWS region in the EC2 Instance Metadata Service (IMDS)` messages with multi-second gaps.
-  - **Workaround:** set `AWS_REGION=<any>` in the environment. Note that `AWS_EC2_METADATA_DISABLED=true` did **not** help on the buggy version; `AWS_REGION` did.
-  - **`--no-lookups` does NOT fix this.** It only skips *app-level* context providers; the CLI still probes IMDS for its own region default.
-- **Other CLI-side waits** to consider when wall-clock >> CPU: credential provider chains, the telemetry endpoint.
-- **Fix path caveat:** the fix for a CLI-version bug is often `yarn upgrade aws-cdk`, which may be blocked by an org's version-bump workflow. Flag it; don't assume you can ship it.
-
 ## Construction Phase (user code + its dependencies)
 
 "Construction" is everything between `new App()` and `app.synth()`. In real-world apps — especially `ts-node`/`tsx` apps — this is frequently the **dominant** segment (one engagement: ~90%; construct instantiation ~38%, module load/compile ~18%, asset staging ~9.5%). The framework-synthesis sub-phases were a minority. The skill must attribute this time, not treat it as a black box.
@@ -56,11 +45,11 @@ What to look at:
 - **Construct instantiation** — loops that create constructs (check iteration count × per-construct cost), deep trees, third-party construct libraries doing initialization work.
 - **Module load / compile** — `Module._compile` / `require.extensions` walking the `aws-cdk-lib` dep graph. Largely structural and not app-addressable, but it sets the floor. `ts-node`/`tsx` transpile cost shows up here too.
 - **Asset staging** — `AssetStaging` runs during construction (not synthesis). This is where bundling subprocesses and file copies happen.
-- **Synchronous `child_process` from dependencies** — see next section; this is the highest-value construction check and the easiest to miss.
+- **Synchronous `child_process` from dependencies** — see next section; this is a high value construction check and the easiest to miss.
 
-### Intercept child_process (highest-value construction check)
+### Intercept child_process
 
-A dependency that shells out synchronously during construction is invisible in the CDK phase mapping and easy to misread in a CPU profile (it looks like idle/wait, not hot CPU). In one engagement this was **60.7% of total runtime** — 132s of 217s — from `spawnSync` calls (~560ms each) that a dependency made to resolve build recipes.
+A dependency that shells out synchronously during construction is invisible in the CDK phase mapping and easy to misread in a CPU profile (it looks like idle/wait, not hot CPU). 
 
 **Technique:** intercept `child_process` with a ~30-line `--require` preload and **group calls by command + argv**. The duplicate count is what makes the bug obvious — in that engagement, **186 of 207 spawns resolved just 3 distinct compile-time-constant strings**, once per stack across ~60 stacks.
 
@@ -93,20 +82,6 @@ Before recommending that the user hand-write an optimization (memoization, cachi
 - Reading a dependency's *resolved* source and seeing no cache does **not** prove the installed behavior — a newer version may add it, and the resolved version may be old. (`@amzn/brazil` memoizes `brazil-path` from 2.0.7 on by default; only the package on an older pinned version lacked it.)
 - The tell that you missed this: one package measures **zero improvement** from a change that helped others — that usually means it resolved a different (newer or older) version. Catch it by checking resolved versions across packages up front, not after.
 - Order of preference for a fix: **dependency bump > config change > hand-written code.**
-
-## Asset Size & Deploy Hygiene (a first-class outcome)
-
-For construction-dominant apps, the most actionable output is often **not a synth-time number** — it's the structural signals in `cdk.out`. Treat staged asset size and file counts as a first-class deliverable alongside wall-clock, and surface them even when synth latency barely moves.
-
-Real payoff from one engagement (synth time ~unchanged, but): total staged assets cut **211MB → 96MB (~55%)** by fixing two things the profile surfaced:
-- A Node Lambda shipping **2,530 `.d.ts` type-declaration files** (plus TS source and lockfiles) into the asset.
-- Three Python Lambdas vendoring the full AWS SDK (`boto3`/`botocore`) that the Lambda runtime **already provides**.
-
-What to collect from `cdk.out/asset.*`:
-- Total staged size and per-asset size (find the worst offenders).
-- File **counts** per asset, and file-type breakdown — `.d.ts`, `.ts` source, lockfiles, `node_modules`, vendored SDKs are common dead weight.
-- Missing/ineffective `.dockerignore` or bundling exclude patterns.
-- SDKs/runtimes vendored that the Lambda runtime already provides.
 
 ## How to Capture a CPU Profile
 
