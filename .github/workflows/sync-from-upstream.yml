@@ -5,7 +5,7 @@ on:
     - cron: 5 2 * * *
 
 env:
-  BRANCHES: main v2-release
+  BRANCHES: v2-release
 
 jobs:
   # Check for the presence of a PROJEN_GITHUB_TOKEN secret.
